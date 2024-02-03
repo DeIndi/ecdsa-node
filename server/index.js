@@ -2,6 +2,23 @@ const express = require("express");
 const app = express();
 const cors = require("cors");
 const port = 3042;
+const ethers = require("ethers");
+const redis = require('redis');
+const crypto = require('crypto');
+
+let client;
+async function connectToRedis() {
+  client = redis.createClient({
+  });
+
+  client.on('error', (err) => console.log('Redis Client Error', err));
+  client.on('end', () => {
+    console.log('Redis client disconnected. Attempting to reconnect...');
+    setTimeout(connectToRedis, 1000); // Attempt to reconnect after 1 second
+  });
+
+  await client.connect();
+}
 
 app.use(cors());
 app.use(express.json());
@@ -36,9 +53,79 @@ app.post("/send", (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`Listening on port ${port}!`);
+app.post('/auth/nonce', async (req, res) => {
+  const {address}  = JSON.parse(req.body.body);
+  console.log('got address: ', address);
+  if (!ethers.utils.isAddress(address)) {
+    return res.status(400).json({ error: 'Invalid Ethereum address' });
+  }
+
+  const nonce = setNonceForAddress(address);
+  console.log('result nonce: ', nonce);
+  res.json({nonce: nonce})
 });
+
+app.post('/auth/verify', async (req, res) => {
+  const { address, signature } = JSON.parse(req.body.body);
+  console.log('address: ', address);
+  console.log('signature: ', signature);
+  const nonce = await getNonceForAddress(address);
+  console.log('recovered nonce from redis: ', nonce);
+  const isVerified = verifySignature(nonce, signature, address);
+  if (isVerified) {
+    res.json({ authenticated: true });
+  } else {
+    res.json({ authenticated: false });
+  }
+});
+
+function generateRandomNonce() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// Generate a nonce for an address and store it with an expiry
+function setNonceForAddress(address) {
+  const nonce = generateRandomNonce();
+  console.log('generated random nonce: ', nonce);
+  client.set(address, nonce, 'EX', 300, (err, reply) => {
+    if (err) throw err; 
+    console.log(reply);
+  });
+  return nonce;
+}
+
+// Retrieve a nonce for an address
+async function getNonceForAddress(address) {
+  try {
+    const reply = await client.get(address);
+    return reply; // This will be `null` if the key does not exist.
+  } catch (err) {
+    console.error('Error getting nonce for address:', err);
+    throw err;
+  }
+}
+
+
+function verifySignature(nonce, signature, address) {
+  try {
+    const signerAddress = ethers.utils.verifyMessage(nonce, signature);
+
+    return signerAddress.toLowerCase() === address.toLowerCase();
+} catch (error) {
+    console.error("Error verifying signature:", error);
+    return false;
+}
+}
+
+connectToRedis().then(() => {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}).catch((error) => {
+  console.error('Failed to connect to Redis:', error);
+  process.exit(1); // Exit if we can't establish a Redis connection
+});
+
 
 function setInitialBalance(address) {
   if (!balances[address]) {
